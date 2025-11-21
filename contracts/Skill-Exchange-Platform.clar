@@ -8,9 +8,12 @@
 (define-constant ERR-INSUFFICIENT-BALANCE (err u106))
 (define-constant ERR-ESCROW-ACTIVE (err u107))
 (define-constant ERR-INVALID-RATING (err u108))
+(define-constant ERR-DISPUTE-EXISTS (err u109))
+(define-constant ERR-INVALID-RESOLUTION (err u110))
 
 (define-data-var next-service-id uint u1)
 (define-data-var next-escrow-id uint u1)
+(define-data-var next-dispute-id uint u1)
 (define-data-var platform-fee uint u50)
 
 (define-map services uint {
@@ -50,6 +53,18 @@
 })
 
 (define-map user-credits principal uint)
+
+(define-map disputes uint {
+    escrow-id: uint,
+    raised-by: principal,
+    reason: (string-ascii 300),
+    provider-response: (optional (string-ascii 300)),
+    status: (string-ascii 20),
+    resolution: (optional (string-ascii 20)),
+    resolved-by: (optional principal),
+    created-at: uint,
+    resolved-at: (optional uint)
+})
 
 (define-public (register-user (username (string-ascii 50)))
     (let ((caller tx-sender))
@@ -232,4 +247,93 @@
 
 (define-read-only (get-next-escrow-id)
     (var-get next-escrow-id)
+)
+
+(define-public (raise-dispute (escrow-id uint) (reason (string-ascii 300)))
+    (let ((escrow-data (unwrap! (map-get? escrows escrow-id) ERR-NOT-FOUND))
+          (caller tx-sender)
+          (dispute-id (var-get next-dispute-id)))
+        (asserts! (is-eq caller (get consumer escrow-data)) ERR-UNAUTHORIZED)
+        (asserts! (or (is-eq (get status escrow-data) "completed") 
+                      (is-eq (get status escrow-data) "accepted")) 
+                  ERR-INVALID-STATUS)
+        (asserts! (is-none (map-get? disputes dispute-id)) ERR-DISPUTE-EXISTS)
+        (map-set disputes dispute-id {
+            escrow-id: escrow-id,
+            raised-by: caller,
+            reason: reason,
+            provider-response: none,
+            status: "open",
+            resolution: none,
+            resolved-by: none,
+            created-at: stacks-block-height,
+            resolved-at: none
+        })
+        (map-set escrows escrow-id (merge escrow-data { status: "disputed" }))
+        (var-set next-dispute-id (+ dispute-id u1))
+        (ok dispute-id)
+    )
+)
+
+(define-public (respond-to-dispute (dispute-id uint) (response (string-ascii 300)))
+    (let ((dispute-data (unwrap! (map-get? disputes dispute-id) ERR-NOT-FOUND))
+          (escrow-data (unwrap! (map-get? escrows (get escrow-id dispute-data)) ERR-NOT-FOUND))
+          (caller tx-sender))
+        (asserts! (is-eq caller (get provider escrow-data)) ERR-UNAUTHORIZED)
+        (asserts! (is-eq (get status dispute-data) "open") ERR-INVALID-STATUS)
+        (map-set disputes dispute-id (merge dispute-data {
+            provider-response: (some response),
+            status: "responded"
+        }))
+        (ok true)
+    )
+)
+
+(define-public (resolve-dispute (dispute-id uint) (resolution (string-ascii 20)))
+    (let ((dispute-data (unwrap! (map-get? disputes dispute-id) ERR-NOT-FOUND))
+          (escrow-data (unwrap! (map-get? escrows (get escrow-id dispute-data)) ERR-NOT-FOUND))
+          (caller tx-sender)
+          (provider (get provider escrow-data))
+          (consumer (get consumer escrow-data))
+          (credits-amount (get credits-amount escrow-data))
+          (provider-balance (default-to u0 (map-get? user-credits provider)))
+          (consumer-balance (default-to u0 (map-get? user-credits consumer))))
+        (asserts! (is-eq caller CONTRACT-OWNER) ERR-OWNER-ONLY)
+        (asserts! (or (is-eq (get status dispute-data) "open") 
+                      (is-eq (get status dispute-data) "responded")) 
+                  ERR-INVALID-STATUS)
+        (asserts! (or (is-eq resolution "refund-consumer") 
+                      (is-eq resolution "pay-provider") 
+                      (is-eq resolution "split")) 
+                  ERR-INVALID-RESOLUTION)
+        (if (is-eq resolution "refund-consumer")
+            (map-set user-credits consumer (+ consumer-balance credits-amount))
+            (if (is-eq resolution "pay-provider")
+                (begin
+                    (map-set user-credits provider (+ provider-balance credits-amount))
+                    (try! (update-provider-stats provider))
+                )
+                (begin
+                    (map-set user-credits consumer (+ consumer-balance (/ credits-amount u2)))
+                    (map-set user-credits provider (+ provider-balance (/ credits-amount u2)))
+                )
+            )
+        )
+        (map-set disputes dispute-id (merge dispute-data {
+            status: "resolved",
+            resolution: (some resolution),
+            resolved-by: (some caller),
+            resolved-at: (some stacks-block-height)
+        }))
+        (map-set escrows (get escrow-id dispute-data) (merge escrow-data { status: "resolved" }))
+        (ok true)
+    )
+)
+
+(define-read-only (get-dispute (dispute-id uint))
+    (map-get? disputes dispute-id)
+)
+
+(define-read-only (get-next-dispute-id)
+    (var-get next-dispute-id)
 )
